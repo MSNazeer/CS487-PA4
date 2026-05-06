@@ -2,8 +2,10 @@ import azure.functions as func
 import azure.durable_functions as df
 import os, json, time, requests
 
+# Initialize the Durable Cook App
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
+# 1. HTTP Starter: Triggered by your Web App UI
 @app.route(route="orchestrators/my_orchestrator", methods=["POST"])
 @app.durable_client_input(client_name="client")
 async def http_starter(req: func.HttpRequest, client) -> func.HttpResponse:
@@ -11,38 +13,40 @@ async def http_starter(req: func.HttpRequest, client) -> func.HttpResponse:
     instance_id = await client.start_new("my_orchestrator", client_input=order)
     return client.create_check_status_response(req, instance_id)
 
+# 2. Orchestrator: Manages the workflow sequence
 @app.orchestration_trigger(context_name="context")
 def my_orchestrator(context: df.DurableOrchestrationContext):
-    # 1. Get the input order
+    # Get the input order from the starter
     order = context.get_input()
     
-    # 2. Call validate_activity with the order
+    # Step A: Call the validation activity
     validation = yield context.call_activity("validate_activity", order)
     
-    # 3. If invalid, return {"status": "rejected", "reason": <reason>}
+    # If the validation API returns invalid, stop here
     if not validation.get("valid"):
         return {"status": "rejected", "reason": validation.get("reason", "unknown")}
     
-    # 4. If valid, call report_activity with the order
+    # Step B: If valid, call the report generation activity
     report_url = yield context.call_activity("report_activity", order)
     
-    # 5. Return {"status": "completed", "report_url": <report_url>}
+    # Return final success state to the UI
     return {"status": "completed", "report_url": report_url}
 
+# 3. Activity: Validates the order against your external Validate-API
 @app.activity_trigger(input_name="order")
 def validate_activity(order: dict) -> dict:
-    # 1. Get VALIDATE_URL from environment variables
+    # This URL must be set in your Function App Environment Variables
     validate_url = os.environ["VALIDATE_URL"]
     
-    # 2. Make a POST request to VALIDATE_URL with the order as JSON
+    # Calls your external Web App API
     r = requests.post(validate_url, json=order)
     
-    # 3. Raise an exception if the request fails (r.raise_for_status())
+    # If this returns 404, check that VALIDATE_URL points to the correct Web App path
     r.raise_for_status()
     
-    # 4. Return the parsed JSON response
     return r.json()
 
+# 4. Activity: Provisions an ACI container to generate the PDF report
 @app.activity_trigger(input_name="order")
 def report_activity(order: dict) -> str:
     from azure.mgmt.containerinstance import ContainerInstanceManagementClient
@@ -53,6 +57,7 @@ def report_activity(order: dict) -> str:
     )
     from azure.identity import DefaultAzureCredential
 
+    # Load infrastructure settings from environment variables
     sub_id   = os.environ["SUBSCRIPTION_ID"]
     rg       = os.environ["REPORT_RG"]
     loc      = os.environ["REPORT_LOCATION"]
@@ -66,7 +71,7 @@ def report_activity(order: dict) -> str:
     rollnum = rg.split("-")[-1]
     mi_id = f"/subscriptions/{sub_id}/resourcegroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/mi-pa4-{rollnum}"
     
-    # Create the container group with specified resources and restart policy
+    # Define the Container Group
     group = ContainerGroup(
         location=loc, 
         os_type=OperatingSystemTypes.linux,
@@ -91,10 +96,10 @@ def report_activity(order: dict) -> str:
                 EnvironmentVariable(name="AZURE_CLIENT_ID", value=os.environ["AZURE_CLIENT_ID"]),
             ])])
     
-    # Start the creation/update
+    # Deploy the container
     client.container_groups.begin_create_or_update(rg, name, group).result()
 
-    # Poll until Succeeded (or 5 min max)
+    # Wait for the container to complete (Max 5 minutes)
     for _ in range(60):
         info = client.container_groups.get(rg, name)
         state = info.instance_view.state if info.instance_view else None
@@ -102,8 +107,8 @@ def report_activity(order: dict) -> str:
             break
         time.sleep(5)
 
-    # Clean up so it stops being a visible resource
+    # Clean up the container resource after completion
     client.container_groups.begin_delete(rg, name)
 
-    # Return the expected blob URL
+    # Return the URL where the PDF will be stored
     return f"{os.environ['STORAGE_ACCOUNT_URL']}/reports/{order_id}.pdf"
